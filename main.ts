@@ -1,20 +1,21 @@
 /**
  * JS Event Loop simulation
  */
-
 const macro_task_queue = new Array<() => void>();
 const micro_task_queue = new Array<() => void>();
 
 function queueMicroTask(task: () => void) {
+  log('queueMicroTask', getName(task));
   micro_task_queue.push(task);
 }
 
 function queueMacroTask(task: () => void) {
+  log('queueMacroTask', getName(task));
   macro_task_queue.push(task);
 }
 
 class MyPromise<T> {
-  name: string = '';
+  name: string = 'unnamed';
   private state: 'pending' | 'resolved' | 'rejected' = 'pending';
   private result: T | undefined;
   private handlers: {
@@ -24,54 +25,55 @@ class MyPromise<T> {
     reject: (err: any) => void;
   }[] = [];
 
-  constructor(callback: (resolve: (result?: T) => void, reject: (err?: any) => void) => void) {
-    // callback is immediately called
+  constructor(callback: (resolve: (result?: T) => void, reject: (err?: any) => void) => void, cfg: { name?: string } = {}) {
+    this.name = cfg.name || this.name;
     callback(
       (result?: T) => {
-        micro_task_queue.push(() => {
-          log(this.name, 'resolved', result);
+        queueMicroTask(named(`${getName(callback)}.resolve`, () => {
           this.changeState('resolved', result);
-        });
+        }));
       },
       (err?: any) => {
-        micro_task_queue.push(() => {
-          log('rejected');
+        queueMicroTask(named(`${getName(callback)}.reject`, () => {
           this.changeState('rejected', err);
-        });
+        }));
       }
     );
   }
 
   then(onFullfilled: (result?: T) => void, onRejected?: (err?: any) => void) {
-    return new MyPromise((resolve, reject) => {
-      this.handlers.push({
-        onFullfilled,
-        onRejected,
-        resolve,
-        reject,
-      });
-      this.run();
-    });
+    return new MyPromise(
+      named(`${this.name}.then`,
+        (resolve, reject) => {
+          this.handlers.push({
+            onFullfilled,
+            onRejected,
+            resolve: named(`${this.name}.then.resolve`, resolve),
+            reject: named(`${this.name}.then.reject`, reject),
+          });
+          this.run();
+        }
+      ),
+      { name: `${this.name}.then` }
+    )
   }
 
   private _run(cb: any, resolve: (result?: any) => void, reject: (err?: any) => void) {
-    queueMicroTask(() => {
-      if (typeof cb !== 'function') {
-        const settled = this.state === 'resolved' ? resolve : reject;
-        settled?.(this.result!);
-        return;
+    if (typeof cb !== 'function') {
+      const settled = this.state === 'resolved' ? resolve : reject;
+      settled?.(this.result!);
+      return;
+    }
+    try {
+      const result = cb(this.result!);
+      if (result instanceof MyPromise) {
+        result.then(resolve, reject);
+      } else {
+        resolve(result);
       }
-      try {
-        const result = cb(this.result!);
-        if (result instanceof MyPromise) {
-          result.then(resolve, reject);
-        } else {
-          resolve(result);
-        }
-      } catch (err) {
-        reject?.(err);
-      }
-    })
+    } catch (err) {
+      reject?.(err);
+    }
   }
 
   private run() {
@@ -133,7 +135,6 @@ class WebApi {
 const sim_time_resolution = 100; //ms
 
 function pseudoEventLoopThread() {
-  let is_idle = false
   let waited_time = 0;
   const eventLoop = setInterval(() => {
     if (macro_task_queue.length > 0) {
@@ -144,7 +145,6 @@ function pseudoEventLoopThread() {
         const task = micro_task_queue.shift()!;
         task();
       }
-      is_idle = false;
       waited_time = 0;
     } else {
       // no more ongoing tasks, but possibly there are pending WebApi calls
@@ -160,17 +160,16 @@ function pseudoEventLoopThread() {
         clearInterval(eventLoop);
       } else {
         // cannot terminate yet, wait for next iteration
-        is_idle = true;
         waited_time += sim_time_resolution;
         process.stdout.write('\r');
-        process.stdout.write(`Idle for ${waited_time / 1000} seconds`);
+        process.stdout.write(`EventLoop: Idle for ${waited_time / 1000} seconds (promise: ${_waiting_promises}, api: ${WebApi.timeouts.length})`);
       }
     }
     // update time
     WebApi.timeouts.forEach((timeout) => {
       timeout.t -= sim_time_resolution;
       if (timeout.t <= 0) {
-        macro_task_queue.push(timeout.callback);
+        queueMacroTask(timeout.callback);
         // remove timeout
         WebApi.timeouts = WebApi.timeouts.filter((t) => t._id !== timeout._id);
       }
@@ -182,21 +181,37 @@ function log(...args: any[]) {
   console.log(...args);
 }
 
+const nameSymbol = Symbol('name');
+function named(name: string, cb: (...args: any) => any) {
+  // @ts-ignore
+  cb[nameSymbol] = name;
+  return cb;
+}
+
+function getName(cb: (...args: any) => any) {
+  // @ts-ignore
+  return cb[nameSymbol] || cb.name || 'unnamed';
+}
+
 function main() {
   var a: any;
-  var b = new MyPromise((resolve, reject) => {
-    log('promise1');
-    MySetTimeout(() => {
-      resolve();
-    }, 1000);
-  }).then(() => {
-    log('promise2');
-  }).then(() => {
-    log('promise3');
-  }).then(() => {
-    log('promise4');
-  });
-
+  var b = new MyPromise(named('b',
+    (resolve, reject) => {
+      log('promise1');
+      MySetTimeout(
+        named('timeout',
+          () => {
+            resolve();
+          }
+        ), 1000
+      );
+    }), { name: 'b' }).then(() => {
+      log('promise2');
+    }).then(() => {
+      log('promise3');
+    }).then(() => {
+      log('promise4');
+    });
   a = new MyPromise(async (resolve, reject) => {
     log(a)
     await tracked(b);
@@ -205,13 +220,14 @@ function main() {
     await tracked(a);
     resolve(true);
     log('after 2');
-  })
-  a.name = 'a';
+  }, { name: 'a' })
+
+
 
   log('end');
 }
 
-macro_task_queue.push(main);
+queueMacroTask(main);
 
 pseudoEventLoopThread();
 
